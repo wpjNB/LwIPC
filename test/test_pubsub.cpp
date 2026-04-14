@@ -359,7 +359,11 @@ void test_high_frequency_intra() {
     // Each consumer sees at least 80% of messages (ring may drop stale ones)
     const long long min_expected = static_cast<long long>(N) * N_CONS * 8 / 10;
     CHECK(total_received.load() >= min_expected);
-    CHECK(loan_failures < N / 2);  // majority of publishes should loan successfully
+    // With pool size == ring size (256) and N=50000, at any instant only 256
+    // loans can be outstanding; the vast majority complete before the pool is
+    // exhausted, so loan failures should be < 1% of total publishes.
+    static constexpr int kMaxAllowedLoanFailures = N / 100;
+    CHECK(loan_failures <= kMaxAllowedLoanFailures);
 }
 
 // ---------------------------------------------------------------------------

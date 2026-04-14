@@ -200,9 +200,13 @@ struct IntraRingBuffer {
     struct alignas(64) Slot {
         std::atomic<uint64_t> sequence{0};
         T                     data{};
-        // Pad to cache line to avoid false sharing
+        // Pad to the next 64-byte boundary to avoid false sharing between slots.
+        // When kRaw is already a multiple of 64, no extra bytes are needed (the
+        // alignas(64) on the struct accounts for alignment); we keep a minimum of
+        // 1 byte to satisfy the array declaration.
         static constexpr std::size_t kRaw = sizeof(std::atomic<uint64_t>) + sizeof(T);
-        static constexpr std::size_t kPad = (kRaw < 64u) ? (64u - kRaw) : 1u;
+        static constexpr std::size_t kRem = kRaw % 64u;
+        static constexpr std::size_t kPad = (kRem == 0u) ? 1u : (64u - kRem);
         uint8_t _pad[kPad]{};
     };
 
@@ -220,8 +224,12 @@ struct IntraRingBuffer {
     uint64_t push(const T& item) noexcept {
         const uint64_t pos = ctrl.write_pos.fetch_add(1, std::memory_order_acq_rel);
         Slot& s = slots[pos & kMask];
-        s.sequence.store(pos * 2u, std::memory_order_release);     // mark: being written
+        // Mark slot as "being written" (even sequence).  Relaxed is sufficient
+        // here; the release on the second store provides the necessary ordering.
+        s.sequence.store(pos * 2u, std::memory_order_relaxed);
         std::memcpy(&s.data, &item, sizeof(T));
+        // Release: makes the memcpy result visible to consumers before they see
+        // the odd (ready) sequence number.
         s.sequence.store(pos * 2u + 1u, std::memory_order_release); // mark: ready
         return pos;
     }
