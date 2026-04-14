@@ -34,6 +34,23 @@ target_include_directories(lwipc INTERFACE
 target_link_libraries(lwipc INTERFACE rt pthread)
 
 # ---------------------------------------------------------------------------
+# src/ compilation verification library
+#
+#  The headers are template-heavy and header-only by design.
+#  The src/*.cpp files exist to:
+#    - Verify each header compiles cleanly as a standalone translation unit.
+#    - Provide a home for future non-template utilities.
+#  This target is not required by tests but is built to catch include errors.
+# ---------------------------------------------------------------------------
+add_library(lwipc_src STATIC
+  src/object_pool.cpp
+  src/loaned_sample.cpp
+  src/publisher.cpp
+  src/subscriber.cpp
+)
+target_link_libraries(lwipc_src PUBLIC lwipc)
+
+# ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 enable_testing()
@@ -49,6 +66,9 @@ add_lwipc_test(test_ipc_message   tests/test_ipc_message.cpp)
 add_lwipc_test(test_shm_ring_buffer tests/test_shm_ring_buffer.cpp)
 add_lwipc_test(test_pub_sub       tests/test_pub_sub.cpp)
 add_lwipc_test(test_socket_transport tests/test_socket_transport.cpp)
+
+# New: intra-process pub/sub + object pool + loaned sample test
+add_lwipc_test(test_pubsub        test/test_pubsub.cpp)
 
 # ---------------------------------------------------------------------------
 # Examples (not run as tests, just built to verify compilation)
