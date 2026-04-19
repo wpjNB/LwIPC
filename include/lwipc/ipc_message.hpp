@@ -88,6 +88,70 @@ struct ControlCmd {
     uint8_t gear;       // 0=park,1=reverse,2=neutral,3=drive
     uint8_t _pad[3]     = {};
 };
+static_assert(sizeof(ControlCmd) == 16, "ControlCmd must be 16 bytes");
+
+// ---------------------------------------------------------------------------
+// ImageEncoding — pixel layout / format tag
+// ---------------------------------------------------------------------------
+enum class ImageEncoding : uint8_t {
+    UNKNOWN = 0,
+    GRAY8   = 1,   // 8-bit grayscale
+    RGB8    = 2,   // 8-bit packed RGB
+    BGR8    = 3,   // 8-bit packed BGR (OpenCV default)
+    RGBA8   = 4,   // 8-bit RGBA
+    YUV420  = 5,   // planar YUV 4:2:0
+};
+
+// ---------------------------------------------------------------------------
+// ImageFrame<MaxBytes> — fixed-capacity camera frame
+//
+// MaxBytes sets the compile-time buffer size.  A typical use case:
+//   ImageFrame<1920*1080*3>  — uncompressed RGB Full-HD (≈6 MB)
+//   ImageFrame<640*480*3>    — VGA RGB            (≈921 kB)
+//
+// Both are trivially copyable, which is required for Publisher<T,N>.
+// For very large images the zero-copy loan() API avoids stack copies.
+// ---------------------------------------------------------------------------
+template <uint32_t MaxBytes>
+struct ImageFrame {
+    uint32_t      width       = 0;
+    uint32_t      height      = 0;
+    uint32_t      stride      = 0;      // bytes per row
+    uint32_t      byte_count  = 0;      // actual populated bytes (≤ MaxBytes)
+    uint8_t       channels    = 0;
+    ImageEncoding encoding    = ImageEncoding::UNKNOWN;
+    uint8_t       _pad[2]     = {};
+    uint8_t       data[MaxBytes] = {};
+
+    static constexpr uint32_t kMaxBytes = MaxBytes;
+};
+
+// Convenience alias for common resolutions
+using ImageFrameVGA  = ImageFrame<640u * 480u * 4u>;   // RGBA VGA
+using ImageFrameHD   = ImageFrame<1280u * 720u * 3u>;  // RGB 720p
+
+// ---------------------------------------------------------------------------
+// Tensor<MaxElems> — fixed-capacity flat float tensor
+//
+// MaxElems is the maximum number of float elements the tensor can hold.
+// Typical NN output: classification (1000), bounding boxes (300*7≈2100),
+// segmentation masks (512*512≈262 144).
+// ---------------------------------------------------------------------------
+template <uint32_t MaxElems>
+struct Tensor {
+    uint32_t ndim         = 0;       // number of dimensions (≤ 8)
+    uint32_t dims[8]      = {};      // size along each dimension
+    uint32_t num_elements = 0;       // actual populated elements (≤ MaxElems)
+    uint8_t  _pad[4]      = {};
+    float    data[MaxElems] = {};
+
+    static constexpr uint32_t kMaxElems = MaxElems;
+};
+
+// Convenience aliases
+using TensorSmall  = Tensor<1024u>;      // small classification outputs
+using TensorMedium = Tensor<8192u>;      // detection / small feature maps
+using TensorLarge  = Tensor<262144u>;    // segmentation masks (512×512)
 
 // ---------------------------------------------------------------------------
 // IPCMessage — header + owned heap payload

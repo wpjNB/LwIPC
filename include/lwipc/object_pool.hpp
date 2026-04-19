@@ -5,6 +5,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <new>
 #include <type_traits>
 
@@ -94,7 +95,7 @@ public:
             if (head_.compare_exchange_weak(old_head, new_head,
                                             std::memory_order_acq_rel,
                                             std::memory_order_acquire)) {
-                return reinterpret_cast<T*>(&storage_[idx]);
+                return reinterpret_cast<T*>(&storage_[idx].bytes);
             }
         }
     }
@@ -151,17 +152,24 @@ private:
     }
 
     uint16_t index_of_ptr(const T* p) const noexcept {
-        const auto* base = reinterpret_cast<const StorageType*>(&storage_[0]);
-        const auto* slot = reinterpret_cast<const StorageType*>(p);
-        return static_cast<uint16_t>(slot - base);
+        // Compute slot index from pointer arithmetic over the raw byte storage.
+        // Each slot occupies exactly kSlotSize bytes; integer division gives index.
+        const auto* base = reinterpret_cast<const std::byte*>(&storage_[0]);
+        const auto* slot = reinterpret_cast<const std::byte*>(p);
+        return static_cast<uint16_t>((slot - base) / kSlotSize);
     }
 
     // -----------------------------------------------------------------------
-    // Internal storage
+    // Internal storage — replaces deprecated std::aligned_storage_t
     // -----------------------------------------------------------------------
-    using StorageType = std::aligned_storage_t<sizeof(T), alignof(T)>;
+    // Each slot is a raw byte buffer with correct alignment for T.
+    static constexpr std::size_t kSlotSize = sizeof(T);
 
-    alignas(64) std::array<StorageType, Capacity> storage_{};
+    struct alignas(alignof(T)) Slot {
+        std::byte bytes[kSlotSize];
+    };
+
+    alignas(64) std::array<Slot, Capacity> storage_{};
 
     // Free-list next pointers (one per slot)
     alignas(64) std::array<uint16_t, Capacity> next_{};

@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -18,6 +19,17 @@
 #include <unistd.h>
 
 namespace lwipc {
+
+// ---------------------------------------------------------------------------
+// shm_exists() — non-throwing probe: returns true if the named POSIX shm
+//                segment exists and is accessible.
+// ---------------------------------------------------------------------------
+inline bool shm_exists(const std::string& name) noexcept {
+    int fd = ::shm_open(name.c_str(), O_RDONLY, 0);
+    if (fd < 0) return false;
+    ::close(fd);
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // ShmRingBuffer<T, Capacity, Policy>
@@ -129,6 +141,9 @@ public:
         // Mark slot as "ready" (odd sequence = pos*2+1)
         Policy::store(slot.sequence, pos * 2 + 1);
 
+        // Update heartbeat so consumers can detect a live producer
+        ctrl_->last_heartbeat_ns.store(now_ns(), std::memory_order_relaxed);
+
         return pos;
     }
 
@@ -204,14 +219,28 @@ public:
 
     [[nodiscard]] const std::string& name() const noexcept { return shm_name_; }
 
+    /// Returns true if the producer has written at least one message within
+    /// the last @p timeout_ns nanoseconds.  Returns false if no message has
+    /// ever been written or the heartbeat is stale.
+    [[nodiscard]] bool producer_alive(uint64_t timeout_ns) const noexcept {
+        const uint64_t hb = ctrl_->last_heartbeat_ns.load(std::memory_order_relaxed);
+        if (hb == 0) return false;
+        const uint64_t now = now_ns();
+        return (now >= hb) && ((now - hb) <= timeout_ns);
+    }
+
 private:
     // -----------------------------------------------------------------------
+
     // Internal layout
     // -----------------------------------------------------------------------
 
     struct alignas(64) ControlBlock {
         std::atomic<uint64_t> write_pos{0};
-        uint8_t _pad[56];   // pad to 64 bytes (cache-line)
+        // last_heartbeat_ns — updated by the producer on every push().
+        // Consumers use this to detect dead producers.
+        std::atomic<uint64_t> last_heartbeat_ns{0};
+        uint8_t _pad[48];   // pad to 64 bytes (cache-line)
     };
     static_assert(sizeof(ControlBlock) == 64);
 
@@ -276,6 +305,13 @@ private:
     int            fd_{-1};
     ControlBlock*  ctrl_{nullptr};
     Slot*          slots_{nullptr};
+
+    static uint64_t now_ns() noexcept {
+        using namespace std::chrono;
+        return static_cast<uint64_t>(
+            duration_cast<nanoseconds>(
+                system_clock::now().time_since_epoch()).count());
+    }
 };
 
 } // namespace lwipc
