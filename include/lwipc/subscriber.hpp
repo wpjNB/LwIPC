@@ -1,5 +1,6 @@
 #pragma once
 
+#include "channel_stats.hpp"
 #include "publisher.hpp"   // for Publisher<T,Cap>::Slot and IntraRingBuffer
 #include "shm_ring_buffer.hpp"
 
@@ -39,6 +40,14 @@ namespace lwipc {
 //    });
 //    // … later …
 //    sub.stop();
+//
+//  Dead-producer detection
+//  -----------------------
+//    sub.producer_alive(1'000'000'000)  // true if heard within last 1 s
+//
+//  Retry construction
+//  ------------------
+//    auto sub = Subscriber<PointXYZI,128>::try_attach("/lidar", 5000ms);
 // ---------------------------------------------------------------------------
 template <typename T, std::size_t Capacity = 64>
 class Subscriber {
@@ -59,6 +68,29 @@ public:
     Subscriber& operator=(const Subscriber&) = delete;
 
     // -----------------------------------------------------------------------
+    // Factory: try_attach — retry construction with a timeout
+    //
+    //  Returns nullptr on timeout; throws on unexpected errors.
+    //  Useful when the producer might not yet have created the shm segment.
+    // -----------------------------------------------------------------------
+    static std::unique_ptr<Subscriber> try_attach(
+            const std::string& channel_name,
+            std::chrono::milliseconds timeout = std::chrono::milliseconds(5000),
+            std::chrono::milliseconds backoff = std::chrono::milliseconds(10))
+    {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (shm_exists(channel_name)) {
+                try {
+                    return std::make_unique<Subscriber>(channel_name);
+                } catch (...) { /* shm vanished between check and open; retry */ }
+            }
+            std::this_thread::sleep_for(backoff);
+        }
+        return nullptr;
+    }
+
+    // -----------------------------------------------------------------------
     // Polling API
     // -----------------------------------------------------------------------
 
@@ -69,10 +101,29 @@ public:
     /// Non-blocking receive.
     /// Returns true and populates @p header / @p payload if a new slot is ready.
     bool try_receive(CursorType& cursor, IPCHeader& header, T& payload) noexcept {
+        const uint64_t pre_pos = cursor.pos;
         SlotType slot{};
         if (!ring_.pop(cursor, slot)) return false;
+
+        // Account for fast-forward drops
+        if (cursor.pos > pre_pos + 1) {
+            stats_dropped_.fetch_add(cursor.pos - pre_pos - 1, std::memory_order_relaxed);
+        }
+
         header  = slot.header;
         payload = slot.payload;
+        stats_received_.fetch_add(1, std::memory_order_relaxed);
+
+        // Rolling latency estimate (exponential moving average, α ≈ 1/16)
+        const uint64_t now = now_ns();
+        if (header.timestamp_ns > 0 && now >= header.timestamp_ns) {
+            const double lat_us = double(now - header.timestamp_ns) / 1000.0;
+            // α = 1/16 EMA
+            const double prev = avg_latency_us_.load(std::memory_order_relaxed);
+            avg_latency_us_.store(prev + (lat_us - prev) / 16.0,
+                                  std::memory_order_relaxed);
+        }
+
         return true;
     }
 
@@ -117,13 +168,47 @@ public:
         if (worker_.joinable()) worker_.join();
     }
 
+    // -----------------------------------------------------------------------
+    // Dead-producer detection
+    // -----------------------------------------------------------------------
+
+    /// Returns true if the producer has published at least one message within
+    /// the last @p timeout_ns nanoseconds.
+    [[nodiscard]] bool producer_alive(uint64_t timeout_ns) const noexcept {
+        return ring_.producer_alive(timeout_ns);
+    }
+
+    // -----------------------------------------------------------------------
+    // QoS / Statistics
+    // -----------------------------------------------------------------------
+
+    [[nodiscard]] ChannelStats stats() const noexcept {
+        ChannelStats s;
+        s.received        = stats_received_.load(std::memory_order_relaxed);
+        s.dropped         = stats_dropped_.load(std::memory_order_relaxed);
+        s.avg_latency_us  = avg_latency_us_.load(std::memory_order_relaxed);
+        return s;
+    }
+
     [[nodiscard]] const std::string& channel_name() const noexcept { return channel_name_; }
 
 private:
-    std::string                    channel_name_;
+    static uint64_t now_ns() noexcept {
+        using namespace std::chrono;
+        return static_cast<uint64_t>(
+            duration_cast<nanoseconds>(
+                system_clock::now().time_since_epoch()).count());
+    }
+
+    std::string                       channel_name_;
     ShmRingBuffer<SlotType, Capacity> ring_;
-    std::atomic<bool>              stop_flag_{false};
-    std::thread                    worker_;
+    std::atomic<bool>                 stop_flag_{false};
+    std::thread                       worker_;
+
+    // Stats counters (all updated by consumer thread(s); relaxed is sufficient)
+    mutable std::atomic<uint64_t> stats_received_{0};
+    mutable std::atomic<uint64_t> stats_dropped_{0};
+    mutable std::atomic<double>   avg_latency_us_{0.0};
 };
 
 // ---------------------------------------------------------------------------

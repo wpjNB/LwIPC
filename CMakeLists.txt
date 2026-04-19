@@ -23,11 +23,22 @@ elseif(CMAKE_BUILD_TYPE STREQUAL "Debug")
 endif()
 
 # ---------------------------------------------------------------------------
+# Version header (Phase 6.2)
+# Generated into the build tree so installed copies carry the baked version.
+# ---------------------------------------------------------------------------
+configure_file(
+  include/lwipc/lwipc_version.hpp.in
+  ${CMAKE_CURRENT_BINARY_DIR}/include/lwipc/lwipc_version.hpp
+  @ONLY
+)
+
+# ---------------------------------------------------------------------------
 # Header-only interface library  (all modules are header-only)
 # ---------------------------------------------------------------------------
 add_library(lwipc INTERFACE)
 target_include_directories(lwipc INTERFACE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
 # Link POSIX real-time + threading libraries
@@ -51,7 +62,7 @@ add_library(lwipc_src STATIC
 target_link_libraries(lwipc_src PUBLIC lwipc)
 
 # ---------------------------------------------------------------------------
-# Tests
+# Tests  (Phase 6.1: consolidated under tests/)
 # ---------------------------------------------------------------------------
 enable_testing()
 
@@ -62,13 +73,14 @@ function(add_lwipc_test name src)
   set_tests_properties(${name} PROPERTIES TIMEOUT 30)
 endfunction()
 
-add_lwipc_test(test_ipc_message   tests/test_ipc_message.cpp)
-add_lwipc_test(test_shm_ring_buffer tests/test_shm_ring_buffer.cpp)
-add_lwipc_test(test_pub_sub       tests/test_pub_sub.cpp)
-add_lwipc_test(test_socket_transport tests/test_socket_transport.cpp)
-
-# New: intra-process pub/sub + object pool + loaned sample test
-add_lwipc_test(test_pubsub        test/test_pubsub.cpp)
+add_lwipc_test(test_ipc_message        tests/test_ipc_message.cpp)
+add_lwipc_test(test_shm_ring_buffer    tests/test_shm_ring_buffer.cpp)
+add_lwipc_test(test_pub_sub            tests/test_pub_sub.cpp)
+add_lwipc_test(test_socket_transport   tests/test_socket_transport.cpp)
+add_lwipc_test(test_pubsub             tests/test_pubsub.cpp)
+add_lwipc_test(test_new_features       tests/test_new_features.cpp)
+# Give the new-features test (TCP multi-client + MPMC) extra time
+set_tests_properties(test_new_features PROPERTIES TIMEOUT 120)
 
 # ---------------------------------------------------------------------------
 # Examples (not run as tests, just built to verify compilation)
@@ -84,13 +96,38 @@ add_lwipc_example(socket_bridge     examples/socket_bridge.cpp)
 add_lwipc_example(benchmark         examples/benchmark.cpp)
 
 # ---------------------------------------------------------------------------
-# Install rules (optional)
+# Install rules + CMake package config (Phase 6.3)
 # ---------------------------------------------------------------------------
 include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(
+  FILES ${CMAKE_CURRENT_BINARY_DIR}/include/lwipc/lwipc_version.hpp
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/lwipc
+)
+
 install(TARGETS lwipc EXPORT LwIPCTargets)
 install(EXPORT LwIPCTargets
   FILE LwIPCTargets.cmake
   NAMESPACE LwIPC::
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/LwIPC
+)
+
+configure_package_config_file(
+  cmake/LwIPCConfig.cmake.in
+  ${CMAKE_CURRENT_BINARY_DIR}/cmake/LwIPCConfig.cmake
+  INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/LwIPC
+)
+
+write_basic_package_version_file(
+  ${CMAKE_CURRENT_BINARY_DIR}/cmake/LwIPCConfigVersion.cmake
+  VERSION ${PROJECT_VERSION}
+  COMPATIBILITY SameMajorVersion
+)
+
+install(FILES
+  ${CMAKE_CURRENT_BINARY_DIR}/cmake/LwIPCConfig.cmake
+  ${CMAKE_CURRENT_BINARY_DIR}/cmake/LwIPCConfigVersion.cmake
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/LwIPC
 )

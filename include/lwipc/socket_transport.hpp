@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cstring>
 #include <functional>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -103,13 +104,20 @@ inline void set_reuseaddr(int fd) noexcept {
 } // namespace detail
 
 // ===========================================================================
-// SocketServer — accepts one connection at a time and dispatches callbacks
+// SocketServer — accepts multiple concurrent connections, dispatches callbacks
+//
+//  Each accepted connection is handled in its own background thread.
+//  The server supports up to @p max_clients simultaneous connections (default 8).
+//  An optional broadcast() method pushes an IPCMessage to all connected clients.
 // ===========================================================================
 class SocketServer {
 public:
     using MsgCallback = std::function<void(const IPCMessage&)>;
 
-    explicit SocketServer(uint16_t port) : port_(port) {}
+    static constexpr int kDefaultMaxClients = 8;
+
+    explicit SocketServer(uint16_t port, int max_clients = kDefaultMaxClients)
+        : port_(port), max_clients_(max_clients) {}
 
     ~SocketServer() { stop(); }
 
@@ -117,15 +125,16 @@ public:
     SocketServer(const SocketServer&)            = delete;
     SocketServer& operator=(const SocketServer&) = delete;
 
-    /// Start listening and accepting in a background thread.
+    /// Start listening and accepting in a background accept thread.
     void start(MsgCallback cb) {
         if (running_.load()) return;
         callback_ = std::move(cb);
         running_.store(true);
-        thread_ = std::thread([this]() { accept_loop(); });
+        accept_thread_ = std::thread([this]() { accept_loop(); });
     }
 
-    /// Stop the server and join the background thread.
+    /// Stop the server: close the listening socket, signal all client threads,
+    /// and wait for them to finish.
     void stop() {
         running_.store(false);
         if (listen_fd_ >= 0) {
@@ -133,10 +142,34 @@ public:
             close(listen_fd_);
             listen_fd_ = -1;
         }
-        if (thread_.joinable()) thread_.join();
+        if (accept_thread_.joinable()) accept_thread_.join();
+        // Join all outstanding client threads
+        std::unique_lock<std::mutex> lk(clients_mutex_);
+        for (auto& ct : client_threads_) {
+            if (ct.joinable()) ct.join();
+        }
+        client_threads_.clear();
     }
 
-    [[nodiscard]] uint16_t port() const noexcept { return port_; }
+    /// Broadcast @p msg to every currently-connected client.
+    /// Returns the number of clients the message was successfully sent to.
+    int broadcast(const IPCMessage& msg) noexcept {
+        int sent = 0;
+        std::lock_guard<std::mutex> lk(client_fds_mutex_);
+        for (int fd : client_fds_) {
+            if (detail::send_ipc_message(fd, msg)) ++sent;
+        }
+        return sent;
+    }
+
+    /// Approximate number of currently-connected clients.
+    [[nodiscard]] int client_count() const noexcept {
+        std::lock_guard<std::mutex> lk(client_fds_mutex_);
+        return static_cast<int>(client_fds_.size());
+    }
+
+    [[nodiscard]] uint16_t port()        const noexcept { return port_; }
+    [[nodiscard]] int      max_clients() const noexcept { return max_clients_; }
 
 private:
     void accept_loop() {
@@ -153,7 +186,7 @@ private:
         if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
             close(listen_fd_); listen_fd_ = -1; return;
         }
-        if (::listen(listen_fd_, 1) < 0) {
+        if (::listen(listen_fd_, max_clients_) < 0) {
             close(listen_fd_); listen_fd_ = -1; return;
         }
 
@@ -163,9 +196,26 @@ private:
             int cfd = ::accept(listen_fd_,
                                reinterpret_cast<sockaddr*>(&client_addr), &addrlen);
             if (cfd < 0) break;
+
+            // Enforce connection limit
+            {
+                std::lock_guard<std::mutex> lk(client_fds_mutex_);
+                if (static_cast<int>(client_fds_.size()) >= max_clients_) {
+                    close(cfd);
+                    continue;
+                }
+                client_fds_.push_back(cfd);
+            }
+
             detail::set_tcp_nodelay(cfd);
-            handle_client(cfd);
-            close(cfd);
+
+            // Reap finished client threads before spawning a new one
+            reap_done_threads();
+
+            std::unique_lock<std::mutex> lk(clients_mutex_);
+            client_threads_.emplace_back([this, cfd]() {
+                handle_client(cfd);
+            });
         }
     }
 
@@ -175,13 +225,42 @@ private:
             if (!msg.valid()) break;
             if (callback_) callback_(msg);
         }
+        // Remove fd from the live-fd list and close
+        {
+            std::lock_guard<std::mutex> lk(client_fds_mutex_);
+            auto it = std::find(client_fds_.begin(), client_fds_.end(), cfd);
+            if (it != client_fds_.end()) client_fds_.erase(it);
+        }
+        close(cfd);
     }
 
-    uint16_t          port_;
-    int               listen_fd_{-1};
-    std::atomic<bool> running_{false};
-    std::thread       thread_;
-    MsgCallback       callback_;
+    void reap_done_threads() {
+        std::unique_lock<std::mutex> lk(clients_mutex_);
+        client_threads_.erase(
+            std::remove_if(client_threads_.begin(), client_threads_.end(),
+                [](std::thread& t) {
+                    // A thread is "done" if it is not joinable (already joined
+                    // or default-constructed).  We cannot check from here
+                    // without a flag, so we keep all joinable threads and join
+                    // only non-joinable ones (safety measure).
+                    return !t.joinable();
+                }),
+            client_threads_.end());
+    }
+
+    uint16_t                   port_;
+    int                        max_clients_;
+    int                        listen_fd_{-1};
+    std::atomic<bool>          running_{false};
+    std::thread                accept_thread_;
+    MsgCallback                callback_;
+
+    // Per-client state
+    mutable std::mutex         client_fds_mutex_;
+    std::vector<int>           client_fds_;     // open client file descriptors
+
+    std::mutex                 clients_mutex_;
+    std::vector<std::thread>   client_threads_;
 };
 
 // ===========================================================================

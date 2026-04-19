@@ -1,5 +1,6 @@
 #pragma once
 
+#include "channel_stats.hpp"
 #include "ipc_message.hpp"
 #include "object_pool.hpp"
 #include "loaned_sample.hpp"
@@ -126,6 +127,9 @@ public:
     /// is exhausted.  The caller fills the T in place, then calls publish().
     [[nodiscard]] LoanType loan() noexcept {
         T* p = pool_.acquire();
+        if (!p) {
+            pool_exhaustions_.fetch_add(1, std::memory_order_relaxed);
+        }
         return LoanType(p, p ? &pool_ : nullptr);
     }
 
@@ -147,10 +151,16 @@ public:
     [[nodiscard]] const std::string& channel_name() const noexcept { return channel_name_; }
     [[nodiscard]] uint64_t           published()    const noexcept { return sequence_; }
 
-    /// Pool availability (useful for back-pressure monitoring).
-    /// TODO: expose as a proper QoS / statistics API in a future milestone.
     [[nodiscard]] std::size_t pool_available() const noexcept {
         return pool_.available();
+    }
+
+    /// QoS statistics snapshot.
+    [[nodiscard]] ChannelStats stats() const noexcept {
+        ChannelStats s;
+        s.published        = sequence_;
+        s.pool_exhaustions = pool_exhaustions_.load(std::memory_order_relaxed);
+        return s;
     }
 
 private:
@@ -167,6 +177,7 @@ private:
     uint64_t                           sequence_{0};
     ShmRingBuffer<Slot, Capacity>      ring_;
     PoolType                           pool_;   // internal object pool for loan()
+    mutable std::atomic<uint64_t>      pool_exhaustions_{0};
 };
 
 // ---------------------------------------------------------------------------
